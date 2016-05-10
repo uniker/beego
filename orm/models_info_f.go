@@ -1,3 +1,17 @@
+// Copyright 2014 beego Author. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package orm
 
 import (
@@ -9,6 +23,7 @@ import (
 
 var errSkipField = errors.New("skip field")
 
+// field info collection
 type fields struct {
 	pk            *fieldInfo
 	columns       map[string]*fieldInfo
@@ -23,6 +38,7 @@ type fields struct {
 	dbcols        []string
 }
 
+// add field info
 func (f *fields) Add(fi *fieldInfo) (added bool) {
 	if f.fields[fi.name] == nil && f.columns[fi.column] == nil {
 		f.columns[fi.column] = fi
@@ -49,14 +65,17 @@ func (f *fields) Add(fi *fieldInfo) (added bool) {
 	return true
 }
 
+// get field info by name
 func (f *fields) GetByName(name string) *fieldInfo {
 	return f.fields[name]
 }
 
+// get field info by column name
 func (f *fields) GetByColumn(column string) *fieldInfo {
 	return f.columns[column]
 }
 
+// get field info by string, name is prior
 func (f *fields) GetByAny(name string) (*fieldInfo, bool) {
 	if fi, ok := f.fields[name]; ok {
 		return fi, ok
@@ -70,6 +89,7 @@ func (f *fields) GetByAny(name string) (*fieldInfo, bool) {
 	return nil, false
 }
 
+// create new field info collection
 func newFields() *fields {
 	f := new(fields)
 	f.fields = make(map[string]*fieldInfo)
@@ -79,9 +99,10 @@ func newFields() *fields {
 	return f
 }
 
+// single field info
 type fieldInfo struct {
 	mi                  *modelInfo
-	fieldIndex          int
+	fieldIndex          []int
 	fieldType           int
 	dbcol               bool
 	inModel             bool
@@ -93,17 +114,19 @@ type fieldInfo struct {
 	auto                bool
 	pk                  bool
 	null                bool
-	blank               bool
 	index               bool
 	unique              bool
+	colDefault          bool
 	initial             StrTo
 	size                int
-	auto_now            bool
-	auto_now_add        bool
+	autoNow             bool
+	autoNowAdd          bool
 	rel                 bool
 	reverse             bool
 	reverseField        string
 	reverseFieldInfo    *fieldInfo
+	reverseFieldInfoTwo *fieldInfo
+	reverseFieldInfoM2M *fieldInfo
 	relTable            string
 	relThrough          string
 	relThroughModelInfo *modelInfo
@@ -114,7 +137,8 @@ type fieldInfo struct {
 	onDelete            string
 }
 
-func newFieldInfo(mi *modelInfo, field reflect.Value, sf reflect.StructField) (fi *fieldInfo, err error) {
+// new field info
+func newFieldInfo(mi *modelInfo, field reflect.Value, sf reflect.StructField, mName string) (fi *fieldInfo, err error) {
 	var (
 		tag       string
 		tagValue  string
@@ -127,10 +151,14 @@ func newFieldInfo(mi *modelInfo, field reflect.Value, sf reflect.StructField) (f
 
 	fi = new(fieldInfo)
 
-	if field.Kind() != reflect.Ptr && field.Kind() != reflect.Slice && field.CanAddr() {
+	addrField = field
+	if field.CanAddr() && field.Kind() != reflect.Ptr {
 		addrField = field.Addr()
-	} else {
-		addrField = field
+		if _, ok := addrField.Interface().(Fielder); !ok {
+			if field.Kind() == reflect.Slice {
+				addrField = field
+			}
+		}
 	}
 
 	parseStructTag(sf.Tag.Get(defaultStructTagName), &attrs, &tags)
@@ -195,6 +223,11 @@ checkType:
 				break checkType
 			case "many":
 				fieldType = RelReverseMany
+				if tv := tags["rel_table"]; tv != "" {
+					fi.relTable = tv
+				} else if tv := tags["rel_through"]; tv != "" {
+					fi.relThrough = tv
+				}
 				break checkType
 			default:
 				err = fmt.Errorf("error")
@@ -245,19 +278,22 @@ checkType:
 	fi.column = getColumnName(fieldType, addrField, sf, tags["column"])
 	fi.addrValue = addrField
 	fi.sf = sf
-	fi.fullName = mi.fullName + "." + sf.Name
+	fi.fullName = mi.fullName + mName + "." + sf.Name
 
 	fi.null = attrs["null"]
-	fi.blank = attrs["blank"]
 	fi.index = attrs["index"]
 	fi.auto = attrs["auto"]
 	fi.pk = attrs["pk"]
 	fi.unique = attrs["unique"]
 
+	// Mark object property if there is attribute "default" in the orm configuration
+	if _, ok := tags["default"]; ok {
+		fi.colDefault = true
+	}
+
 	switch fieldType {
 	case RelManyToMany, RelReverseMany, RelReverseOne:
 		fi.null = false
-		fi.blank = false
 		fi.index = false
 		fi.auto = false
 		fi.pk = false
@@ -278,20 +314,20 @@ checkType:
 
 	if fi.rel && fi.dbcol {
 		switch onDelete {
-		case od_CASCADE, od_DO_NOTHING:
-		case od_SET_DEFAULT:
+		case odCascade, odDoNothing:
+		case odSetDefault:
 			if initial.Exist() == false {
 				err = errors.New("on_delete: set_default need set field a default value")
 				goto end
 			}
-		case od_SET_NULL:
+		case odSetNULL:
 			if fi.null == false {
 				err = errors.New("on_delete: set_null need set field null")
 				goto end
 			}
 		default:
 			if onDelete == "" {
-				onDelete = od_CASCADE
+				onDelete = odCascade
 			} else {
 				err = fmt.Errorf("on_delete value expected choice in `cascade,set_null,set_default,do_nothing`, unknown `%s`", onDelete)
 				goto end
@@ -319,9 +355,9 @@ checkType:
 		fi.unique = false
 	case TypeDateField, TypeDateTimeField:
 		if attrs["auto_now"] {
-			fi.auto_now = true
+			fi.autoNow = true
 		} else if attrs["auto_now_add"] {
-			fi.auto_now_add = true
+			fi.autoNowAdd = true
 		}
 	case TypeFloatField:
 	case TypeDecimalField:
@@ -347,35 +383,26 @@ checkType:
 			err = fmt.Errorf("non-integer type cannot set auto")
 			goto end
 		}
-
-		if fi.pk || fi.index || fi.unique {
-			if fieldType != TypeCharField && fieldType != RelOneToOne {
-				err = fmt.Errorf("cannot set pk/index/unique")
-				goto end
-			}
-		}
 	}
 
 	if fi.auto || fi.pk {
 		if fi.auto {
 
 			switch addrField.Elem().Kind() {
-			case reflect.Int, reflect.Int32, reflect.Int64:
+			case reflect.Int, reflect.Int32, reflect.Int64, reflect.Uint, reflect.Uint32, reflect.Uint64:
 			default:
-				err = fmt.Errorf("auto primary key only support int, int32, int64, but found `%s`", addrField.Elem().Kind())
+				err = fmt.Errorf("auto primary key only support int, int32, int64, uint, uint32, uint64 but found `%s`", addrField.Elem().Kind())
 				goto end
 			}
 
 			fi.pk = true
 		}
 		fi.null = false
-		fi.blank = false
 		fi.index = false
 		fi.unique = false
 	}
 
 	if fi.unique {
-		fi.blank = false
 		fi.index = false
 	}
 

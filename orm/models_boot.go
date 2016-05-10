@@ -1,3 +1,17 @@
+// Copyright 2014 beego Author. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package orm
 
 import (
@@ -8,13 +22,15 @@ import (
 	"strings"
 )
 
-func registerModel(model interface{}, prefix string) {
+// register models.
+// prefix means table name prefix.
+func registerModel(prefix string, model interface{}) {
 	val := reflect.ValueOf(model)
 	ind := reflect.Indirect(val)
 	typ := ind.Type()
 
 	if val.Kind() != reflect.Ptr {
-		panic(fmt.Sprintf("<orm.RegisterModel> cannot use non-ptr model struct `%s`", getFullName(typ)))
+		panic(fmt.Errorf("<orm.RegisterModel> cannot use non-ptr model struct `%s`", getFullName(typ)))
 	}
 
 	table := getTableName(val)
@@ -35,19 +51,16 @@ func registerModel(model interface{}, prefix string) {
 	}
 
 	info := newModelInfo(val)
-
 	if info.fields.pk == nil {
 	outFor:
 		for _, fi := range info.fields.fieldsDB {
-			if fi.name == "Id" {
-				if fi.sf.Tag.Get(defaultStructTagName) == "" {
-					switch fi.addrValue.Elem().Kind() {
-					case reflect.Int, reflect.Int64, reflect.Int32:
-						fi.auto = true
-						fi.pk = true
-						info.fields.pk = fi
-						break outFor
-					}
+			if strings.ToLower(fi.name) == "id" {
+				switch fi.addrValue.Elem().Kind() {
+				case reflect.Int, reflect.Int32, reflect.Int64, reflect.Uint, reflect.Uint32, reflect.Uint64:
+					fi.auto = true
+					fi.pk = true
+					info.fields.pk = fi
+					break outFor
 				}
 			}
 		}
@@ -67,6 +80,7 @@ func registerModel(model interface{}, prefix string) {
 	modelCache.set(table, info)
 }
 
+// boostrap models
 func bootStrap() {
 	if modelCache.done {
 		return
@@ -106,9 +120,7 @@ func bootStrap() {
 						msg := fmt.Sprintf("field `%s` wrong rel_through value `%s`", fi.fullName, fi.relThrough)
 						if i := strings.LastIndex(fi.relThrough, "."); i != -1 && len(fi.relThrough) > (i+1) {
 							pn := fi.relThrough[:i]
-							mn := fi.relThrough[i+1:]
-							tn := snakeString(mn)
-							rmi, ok := modelCache.get(tn)
+							rmi, ok := modelCache.getByFN(fi.relThrough)
 							if ok == false || pn != rmi.pkg {
 								err = errors.New(msg + " cannot find table")
 								goto end
@@ -121,7 +133,6 @@ func bootStrap() {
 							err = errors.New(msg)
 							goto end
 						}
-						err = nil
 					} else {
 						i := newM2MModelInfo(mi, mii)
 						if fi.relTable != "" {
@@ -135,6 +146,8 @@ func bootStrap() {
 						fi.relTable = i.table
 						fi.relThroughModelInfo = i
 					}
+
+					fi.relThroughModelInfo.isThrough = true
 				}
 			}
 		}
@@ -152,6 +165,7 @@ func bootStrap() {
 						break
 					}
 				}
+
 				if inModel == false {
 					rmi := fi.relModelInfo
 					ffi := new(fieldInfo)
@@ -177,7 +191,7 @@ func bootStrap() {
 							}
 						}
 						if added == false {
-							panic(fmt.Sprintf("cannot generate auto reverse field info `%s` to `%s`", fi.fullName, ffi.fullName))
+							panic(fmt.Errorf("cannot generate auto reverse field info `%s` to `%s`", fi.fullName, ffi.fullName))
 						}
 					}
 				}
@@ -185,9 +199,38 @@ func bootStrap() {
 		}
 	}
 
+	models = modelCache.all()
 	for _, mi := range models {
-		if fields, ok := mi.fields.fieldsByType[RelReverseOne]; ok {
-			for _, fi := range fields {
+		for _, fi := range mi.fields.fieldsRel {
+			switch fi.fieldType {
+			case RelManyToMany:
+				for _, ffi := range fi.relThroughModelInfo.fields.fieldsRel {
+					switch ffi.fieldType {
+					case RelOneToOne, RelForeignKey:
+						if ffi.relModelInfo == fi.relModelInfo {
+							fi.reverseFieldInfoTwo = ffi
+						}
+						if ffi.relModelInfo == mi {
+							fi.reverseField = ffi.name
+							fi.reverseFieldInfo = ffi
+						}
+					}
+				}
+
+				if fi.reverseFieldInfoTwo == nil {
+					err = fmt.Errorf("can not find m2m field for m2m model `%s`, ensure your m2m model defined correct",
+						fi.relThroughModelInfo.fullName)
+					goto end
+				}
+			}
+		}
+	}
+
+	models = modelCache.all()
+	for _, mi := range models {
+		for _, fi := range mi.fields.fieldsReverse {
+			switch fi.fieldType {
+			case RelReverseOne:
 				found := false
 			mForA:
 				for _, ffi := range fi.relModelInfo.fields.fieldsByType[RelOneToOne] {
@@ -195,6 +238,9 @@ func bootStrap() {
 						found = true
 						fi.reverseField = ffi.name
 						fi.reverseFieldInfo = ffi
+
+						ffi.reverseField = fi.name
+						ffi.reverseFieldInfo = fi
 						break mForA
 					}
 				}
@@ -202,10 +248,7 @@ func bootStrap() {
 					err = fmt.Errorf("reverse field `%s` not found in model `%s`", fi.fullName, fi.relModelInfo.fullName)
 					goto end
 				}
-			}
-		}
-		if fields, ok := mi.fields.fieldsByType[RelReverseMany]; ok {
-			for _, fi := range fields {
+			case RelReverseMany:
 				found := false
 			mForB:
 				for _, ffi := range fi.relModelInfo.fields.fieldsByType[RelForeignKey] {
@@ -213,22 +256,35 @@ func bootStrap() {
 						found = true
 						fi.reverseField = ffi.name
 						fi.reverseFieldInfo = ffi
+
+						ffi.reverseField = fi.name
+						ffi.reverseFieldInfo = fi
+
 						break mForB
 					}
 				}
 				if found == false {
 				mForC:
 					for _, ffi := range fi.relModelInfo.fields.fieldsByType[RelManyToMany] {
-						if ffi.relModelInfo == mi {
+						conditions := fi.relThrough != "" && fi.relThrough == ffi.relThrough ||
+							fi.relTable != "" && fi.relTable == ffi.relTable ||
+							fi.relThrough == "" && fi.relTable == ""
+						if ffi.relModelInfo == mi && conditions {
 							found = true
-							fi.reverseField = ffi.name
-							fi.reverseFieldInfo = ffi
+
+							fi.reverseField = ffi.reverseFieldInfoTwo.name
+							fi.reverseFieldInfo = ffi.reverseFieldInfoTwo
+							fi.relThroughModelInfo = ffi.relThroughModelInfo
+							fi.reverseFieldInfoTwo = ffi.reverseFieldInfo
+							fi.reverseFieldInfoM2M = ffi
+							ffi.reverseFieldInfoM2M = fi
+
 							break mForC
 						}
 					}
 				}
 				if found == false {
-					err = fmt.Errorf("reverse field `%s` not found in model `%s`", fi.fullName, fi.relModelInfo.fullName)
+					err = fmt.Errorf("reverse field for `%s` not found in model `%s`", fi.fullName, fi.relModelInfo.fullName)
 					goto end
 				}
 			}
@@ -242,27 +298,24 @@ end:
 	}
 }
 
+// RegisterModel register models
 func RegisterModel(models ...interface{}) {
-	if modelCache.done {
-		panic(fmt.Errorf("RegisterModel must be run before BootStrap"))
-	}
-
-	for _, model := range models {
-		registerModel(model, "")
-	}
+	RegisterModelWithPrefix("", models...)
 }
 
-// register model with a prefix
+// RegisterModelWithPrefix register models with a prefix
 func RegisterModelWithPrefix(prefix string, models ...interface{}) {
 	if modelCache.done {
 		panic(fmt.Errorf("RegisterModel must be run before BootStrap"))
 	}
 
 	for _, model := range models {
-		registerModel(model, prefix)
+		registerModel(prefix, model)
 	}
 }
 
+// BootStrap bootrap models.
+// make all model parsed and can not add more models
 func BootStrap() {
 	if modelCache.done {
 		return

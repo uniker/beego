@@ -6,8 +6,6 @@ A powerful orm framework for go.
 
 It is heavily influenced by Django ORM, SQLAlchemy.
 
-now, beta, unstable, may be changing some api make your app build failed.
-
 **Support Database:**
 
 * MySQL: [github.com/go-sql-driver/mysql](https://github.com/go-sql-driver/mysql)
@@ -119,7 +117,7 @@ o.Begin()
 ...
 user := User{Name: "slene"}
 id, err := o.Insert(&user)
-if err != nil {
+if err == nil {
 	o.Commit()
 } else {
 	o.Rollback()
@@ -154,10 +152,5 @@ note: not recommend use this in product env.
 
 more details and examples in docs and test
 
-* [中文](docs/zh)
-* English
+[documents](http://beego.me/docs/mvc/model/overview.md)
 
-## TODO
-- some unrealized api
-- examples
-- docs

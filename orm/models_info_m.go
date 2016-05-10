@@ -1,12 +1,26 @@
+// Copyright 2014 beego Author. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package orm
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"reflect"
 )
 
+// single model info
 type modelInfo struct {
 	pkg       string
 	name      string
@@ -16,14 +30,12 @@ type modelInfo struct {
 	fields    *fields
 	manual    bool
 	addrField reflect.Value
+	uniques   []string
+	isThrough bool
 }
 
+// new model info
 func newModelInfo(val reflect.Value) (info *modelInfo) {
-	var (
-		err error
-		fi  *fieldInfo
-		sf  reflect.StructField
-	)
 
 	info = &modelInfo{}
 	info.fields = newFields()
@@ -31,15 +43,36 @@ func newModelInfo(val reflect.Value) (info *modelInfo) {
 	ind := reflect.Indirect(val)
 	typ := ind.Type()
 
-	info.addrField = ind.Addr()
+	info.addrField = val
 
 	info.name = typ.Name()
 	info.fullName = getFullName(typ)
 
+	addModelFields(info, ind, "", []int{})
+
+	return
+}
+
+func addModelFields(info *modelInfo, ind reflect.Value, mName string, index []int) {
+	var (
+		err error
+		fi  *fieldInfo
+		sf  reflect.StructField
+	)
+
 	for i := 0; i < ind.NumField(); i++ {
 		field := ind.Field(i)
 		sf = ind.Type().Field(i)
-		fi, err = newFieldInfo(info, field, sf)
+		if sf.PkgPath != "" {
+			continue
+		}
+		// add anonymous struct fields
+		if sf.Anonymous {
+			addModelFields(info, field, mName+"."+sf.Name, append(index, i))
+			continue
+		}
+
+		fi, err = newFieldInfo(info, field, sf, mName)
 
 		if err != nil {
 			if err == errSkipField {
@@ -51,31 +84,32 @@ func newModelInfo(val reflect.Value) (info *modelInfo) {
 
 		added := info.fields.Add(fi)
 		if added == false {
-			err = errors.New(fmt.Sprintf("duplicate column name: %s", fi.column))
+			err = fmt.Errorf("duplicate column name: %s", fi.column)
 			break
 		}
 
 		if fi.pk {
 			if info.fields.pk != nil {
-				err = errors.New(fmt.Sprintf("one model must have one pk field only"))
+				err = fmt.Errorf("one model must have one pk field only")
 				break
 			} else {
 				info.fields.pk = fi
 			}
 		}
 
-		fi.fieldIndex = i
+		fi.fieldIndex = append(index, i)
 		fi.mi = info
+		fi.inModel = true
 	}
 
 	if err != nil {
 		fmt.Println(fmt.Errorf("field: %s.%s, %s", ind.Type(), sf.Name, err))
 		os.Exit(2)
 	}
-
-	return
 }
 
+// combine related model info to new model info.
+// prepare for relation models query.
 func newM2MModelInfo(m1, m2 *modelInfo) (info *modelInfo) {
 	info = new(modelInfo)
 	info.fields = newFields()
@@ -117,5 +151,7 @@ func newM2MModelInfo(m1, m2 *modelInfo) (info *modelInfo) {
 	info.fields.Add(f1)
 	info.fields.Add(f2)
 	info.fields.pk = fa
+
+	info.uniques = []string{f1.column, f2.column}
 	return
 }

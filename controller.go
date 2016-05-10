@@ -1,45 +1,91 @@
+// Copyright 2014 beego Author. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package beego
 
 import (
 	"bytes"
-	"compress/flate"
-	"compress/gzip"
-	"crypto/hmac"
-	"crypto/sha1"
-	"encoding/base64"
-	"encoding/json"
-	"encoding/xml"
 	"errors"
-	"fmt"
-	"github.com/astaxie/beego/session"
 	"html/template"
 	"io"
-	"io/ioutil"
 	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
-	"path"
+	"reflect"
 	"strconv"
 	"strings"
-	"time"
+
+	"github.com/astaxie/beego/context"
+	"github.com/astaxie/beego/session"
 )
 
-type Controller struct {
-	Ctx         *Context
-	Data        map[interface{}]interface{}
-	ChildName   string
-	TplNames    string
-	Layout      string
-	TplExt      string
-	_xsrf_token string
-	gotofunc    string
-	CruSession  session.SessionStore
-	XSRFExpire  int
+//commonly used mime-types
+const (
+	applicationJSON = "application/json"
+	applicationXML  = "application/xml"
+	textXML         = "text/xml"
+)
+
+var (
+	// ErrAbort custom error when user stop request handler manually.
+	ErrAbort = errors.New("User stop run")
+	// GlobalControllerRouter store comments with controller. pkgpath+controller:comments
+	GlobalControllerRouter = make(map[string][]ControllerComments)
+)
+
+// ControllerComments store the comment for the controller method
+type ControllerComments struct {
+	Method           string
+	Router           string
+	AllowHTTPMethods []string
+	Params           []map[string]string
 }
 
+// Controller defines some basic http request handler operations, such as
+// http context, template and view, session and xsrf.
+type Controller struct {
+	// context data
+	Ctx  *context.Context
+	Data map[interface{}]interface{}
+
+	// route controller info
+	controllerName string
+	actionName     string
+	methodMapping  map[string]func() //method:routertree
+	gotofunc       string
+	AppController  interface{}
+
+	// template data
+	TplName        string
+	Layout         string
+	LayoutSections map[string]string // the key is the section name and the value is the template name
+	TplExt         string
+	EnableRender   bool
+
+	// xsrf data
+	_xsrfToken string
+	XSRFExpire int
+	EnableXSRF bool
+
+	// session
+	CruSession session.Store
+}
+
+// ControllerInterface is an interface to uniform all controller handler.
 type ControllerInterface interface {
-	Init(ct *Context, cn string)
+	Init(ct *context.Context, controllerName, actionName string, app interface{})
 	Prepare()
 	Get()
 	Post()
@@ -50,273 +96,393 @@ type ControllerInterface interface {
 	Options()
 	Finish()
 	Render() error
+	XSRFToken() string
+	CheckXSRFCookie() bool
+	HandlerFunc(fn string) bool
+	URLMapping()
 }
 
-func (c *Controller) Init(ctx *Context, cn string) {
-	c.Data = make(map[interface{}]interface{})
+// Init generates default values of controller operations.
+func (c *Controller) Init(ctx *context.Context, controllerName, actionName string, app interface{}) {
 	c.Layout = ""
-	c.TplNames = ""
-	c.ChildName = cn
+	c.TplName = ""
+	c.controllerName = controllerName
+	c.actionName = actionName
 	c.Ctx = ctx
 	c.TplExt = "tpl"
+	c.AppController = app
+	c.EnableRender = true
+	c.EnableXSRF = true
+	c.Data = ctx.Input.Data()
+	c.methodMapping = make(map[string]func())
 }
 
-func (c *Controller) Prepare() {
+// Prepare runs after Init before request function execution.
+func (c *Controller) Prepare() {}
 
-}
+// Finish runs after request function execution.
+func (c *Controller) Finish() {}
 
-func (c *Controller) Finish() {
-
-}
-
-func (c *Controller) Destructor() {
-	if c.CruSession != nil {
-		c.CruSession.SessionRelease()
-	}
-}
-
+// Get adds a request function to handle GET request.
 func (c *Controller) Get() {
 	http.Error(c.Ctx.ResponseWriter, "Method Not Allowed", 405)
 }
 
+// Post adds a request function to handle POST request.
 func (c *Controller) Post() {
 	http.Error(c.Ctx.ResponseWriter, "Method Not Allowed", 405)
 }
 
+// Delete adds a request function to handle DELETE request.
 func (c *Controller) Delete() {
 	http.Error(c.Ctx.ResponseWriter, "Method Not Allowed", 405)
 }
 
+// Put adds a request function to handle PUT request.
 func (c *Controller) Put() {
 	http.Error(c.Ctx.ResponseWriter, "Method Not Allowed", 405)
 }
 
+// Head adds a request function to handle HEAD request.
 func (c *Controller) Head() {
 	http.Error(c.Ctx.ResponseWriter, "Method Not Allowed", 405)
 }
 
+// Patch adds a request function to handle PATCH request.
 func (c *Controller) Patch() {
 	http.Error(c.Ctx.ResponseWriter, "Method Not Allowed", 405)
 }
 
+// Options adds a request function to handle OPTIONS request.
 func (c *Controller) Options() {
 	http.Error(c.Ctx.ResponseWriter, "Method Not Allowed", 405)
 }
 
-func (c *Controller) Render() error {
-	rb, err := c.RenderBytes()
-
-	if err != nil {
-		return err
-	} else {
-		c.Ctx.ResponseWriter.Header().Set("Content-Type", "text/html; charset=utf-8")
-		c.writeToWriter(rb)
+// HandlerFunc call function with the name
+func (c *Controller) HandlerFunc(fnname string) bool {
+	if v, ok := c.methodMapping[fnname]; ok {
+		v()
+		return true
 	}
-	return nil
+	return false
 }
 
+// URLMapping register the internal Controller router.
+func (c *Controller) URLMapping() {}
+
+// Mapping the method to function
+func (c *Controller) Mapping(method string, fn func()) {
+	c.methodMapping[method] = fn
+}
+
+// Render sends the response with rendered template bytes as text/html type.
+func (c *Controller) Render() error {
+	if !c.EnableRender {
+		return nil
+	}
+	rb, err := c.RenderBytes()
+	if err != nil {
+		return err
+	}
+	c.Ctx.Output.Header("Content-Type", "text/html; charset=utf-8")
+	return c.Ctx.Output.Body(rb)
+}
+
+// RenderString returns the rendered template string. Do not send out response.
 func (c *Controller) RenderString() (string, error) {
 	b, e := c.RenderBytes()
 	return string(b), e
 }
 
+// RenderBytes returns the bytes of rendered template string. Do not send out response.
 func (c *Controller) RenderBytes() ([]byte, error) {
-	//if the controller has set layout, then first get the tplname's content set the content to the layout
-	if c.Layout != "" {
-		if c.TplNames == "" {
-			c.TplNames = c.ChildName + "/" + strings.ToLower(c.Ctx.Request.Method) + "." + c.TplExt
-		}
-		if RunMode == "dev" {
-			BuildTemplate(ViewsPath)
-		}
-		subdir := path.Dir(c.TplNames)
-		_, file := path.Split(c.TplNames)
-		newbytes := bytes.NewBufferString("")
-		if _, ok := BeeTemplates[subdir]; !ok {
-			panic("can't find templatefile in the path:" + c.TplNames)
-			return []byte{}, errors.New("can't find templatefile in the path:" + c.TplNames)
-		}
-		BeeTemplates[subdir].ExecuteTemplate(newbytes, file, c.Data)
-		tplcontent, _ := ioutil.ReadAll(newbytes)
-		c.Data["LayoutContent"] = template.HTML(string(tplcontent))
-		subdir = path.Dir(c.Layout)
-		_, file = path.Split(c.Layout)
-		ibytes := bytes.NewBufferString("")
-		err := BeeTemplates[subdir].ExecuteTemplate(ibytes, file, c.Data)
-		if err != nil {
-			Trace("template Execute err:", err)
-		}
-		icontent, _ := ioutil.ReadAll(ibytes)
-		return icontent, nil
-	} else {
-		if c.TplNames == "" {
-			c.TplNames = c.ChildName + "/" + strings.ToLower(c.Ctx.Request.Method) + "." + c.TplExt
-		}
-		if RunMode == "dev" {
-			BuildTemplate(ViewsPath)
-		}
-		subdir := path.Dir(c.TplNames)
-		_, file := path.Split(c.TplNames)
-		ibytes := bytes.NewBufferString("")
-		if _, ok := BeeTemplates[subdir]; !ok {
-			panic("can't find templatefile in the path:" + c.TplNames)
-			return []byte{}, errors.New("can't find templatefile in the path:" + c.TplNames)
-		}
-		err := BeeTemplates[subdir].ExecuteTemplate(ibytes, file, c.Data)
-		if err != nil {
-			Trace("template Execute err:", err)
-		}
-		icontent, _ := ioutil.ReadAll(ibytes)
-		return icontent, nil
-	}
-	return []byte{}, nil
-}
+	buf, err := c.renderTemplate()
+	//if the controller has set layout, then first get the tplName's content set the content to the layout
+	if err == nil && c.Layout != "" {
+		c.Data["LayoutContent"] = template.HTML(buf.String())
 
-func (c *Controller) writeToWriter(rb []byte) {
-	output_writer := c.Ctx.ResponseWriter.(io.Writer)
-	if EnableGzip == true && c.Ctx.Request.Header.Get("Accept-Encoding") != "" {
-		splitted := strings.SplitN(c.Ctx.Request.Header.Get("Accept-Encoding"), ",", -1)
-		encodings := make([]string, len(splitted))
-
-		for i, val := range splitted {
-			encodings[i] = strings.TrimSpace(val)
-		}
-		for _, val := range encodings {
-			if val == "gzip" {
-				c.Ctx.ResponseWriter.Header().Set("Content-Encoding", "gzip")
-				output_writer, _ = gzip.NewWriterLevel(c.Ctx.ResponseWriter, gzip.BestSpeed)
-
-				break
-			} else if val == "deflate" {
-				c.Ctx.ResponseWriter.Header().Set("Content-Encoding", "deflate")
-				output_writer, _ = flate.NewWriter(c.Ctx.ResponseWriter, flate.BestSpeed)
-				break
+		if c.LayoutSections != nil {
+			for sectionName, sectionTpl := range c.LayoutSections {
+				if sectionTpl == "" {
+					c.Data[sectionName] = ""
+					continue
+				}
+				buf.Reset()
+				err = executeTemplate(&buf, sectionTpl, c.Data)
+				if err != nil {
+					return nil, err
+				}
+				c.Data[sectionName] = template.HTML(buf.String())
 			}
 		}
-	} else {
-		c.Ctx.SetHeader("Content-Length", strconv.Itoa(len(rb)), true)
+
+		buf.Reset()
+		executeTemplate(&buf, c.Layout, c.Data)
 	}
-	output_writer.Write(rb)
-	switch output_writer.(type) {
-	case *gzip.Writer:
-		output_writer.(*gzip.Writer).Close()
-	case *flate.Writer:
-		output_writer.(*flate.Writer).Close()
-	case io.WriteCloser:
-		output_writer.(io.WriteCloser).Close()
-	}
+	return buf.Bytes(), err
 }
 
+func (c *Controller) renderTemplate() (bytes.Buffer, error) {
+	var buf bytes.Buffer
+	if c.TplName == "" {
+		c.TplName = strings.ToLower(c.controllerName) + "/" + strings.ToLower(c.actionName) + "." + c.TplExt
+	}
+	if BConfig.RunMode == DEV {
+		buildFiles := []string{c.TplName}
+		if c.Layout != "" {
+			buildFiles = append(buildFiles, c.Layout)
+			if c.LayoutSections != nil {
+				for _, sectionTpl := range c.LayoutSections {
+					if sectionTpl == "" {
+						continue
+					}
+					buildFiles = append(buildFiles, sectionTpl)
+				}
+			}
+		}
+		BuildTemplate(BConfig.WebConfig.ViewsPath, buildFiles...)
+	}
+	return buf, executeTemplate(&buf, c.TplName, c.Data)
+}
+
+// Redirect sends the redirection response to url with status code.
 func (c *Controller) Redirect(url string, code int) {
 	c.Ctx.Redirect(code, url)
 }
 
+// Abort stops controller handler and show the error data if code is defined in ErrorMap or code string.
 func (c *Controller) Abort(code string) {
-	panic(code)
+	status, err := strconv.Atoi(code)
+	if err != nil {
+		status = 200
+	}
+	c.CustomAbort(status, code)
 }
 
-func (c *Controller) ServeJson(encoding ...bool) {
-	var content []byte
-	var err error
-	if RunMode == "prod" {
-		content, err = json.Marshal(c.Data["json"])
-	} else {
-		content, err = json.MarshalIndent(c.Data["json"], "", "  ")
+// CustomAbort stops controller handler and show the error data, it's similar Aborts, but support status code and body.
+func (c *Controller) CustomAbort(status int, body string) {
+	c.Ctx.Output.Status = status
+	// first panic from ErrorMaps, is is user defined error functions.
+	if _, ok := ErrorMaps[body]; ok {
+		panic(body)
 	}
-	if err != nil {
-		http.Error(c.Ctx.ResponseWriter, err.Error(), http.StatusInternalServerError)
-		return
+	// last panic user string
+	c.Ctx.ResponseWriter.Write([]byte(body))
+	panic(ErrAbort)
+}
+
+// StopRun makes panic of USERSTOPRUN error and go to recover function if defined.
+func (c *Controller) StopRun() {
+	panic(ErrAbort)
+}
+
+// URLFor does another controller handler in this request function.
+// it goes to this controller method if endpoint is not clear.
+func (c *Controller) URLFor(endpoint string, values ...interface{}) string {
+	if len(endpoint) == 0 {
+		return ""
 	}
-	c.Ctx.ResponseWriter.Header().Set("Content-Type", "application/json;charset=UTF-8")
+	if endpoint[0] == '.' {
+		return URLFor(reflect.Indirect(reflect.ValueOf(c.AppController)).Type().Name()+endpoint, values...)
+	}
+	return URLFor(endpoint, values...)
+}
+
+// ServeJSON sends a json response with encoding charset.
+func (c *Controller) ServeJSON(encoding ...bool) {
+	var (
+		hasIndent   = true
+		hasEncoding = false
+	)
+	if BConfig.RunMode == PROD {
+		hasIndent = false
+	}
 	if len(encoding) > 0 && encoding[0] == true {
-		content = []byte(stringsToJson(string(content)))
+		hasEncoding = true
 	}
-	c.writeToWriter(content)
+	c.Ctx.Output.JSON(c.Data["json"], hasIndent, hasEncoding)
 }
 
-func (c *Controller) ServeJsonp() {
-	var content []byte
-	var err error
-	if RunMode == "prod" {
-		content, err = json.Marshal(c.Data["jsonp"])
-	} else {
-		content, err = json.MarshalIndent(c.Data["jsonp"], "", "  ")
+// ServeJSONP sends a jsonp response.
+func (c *Controller) ServeJSONP() {
+	hasIndent := true
+	if BConfig.RunMode == PROD {
+		hasIndent = false
 	}
-	if err != nil {
-		http.Error(c.Ctx.ResponseWriter, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	callback := c.Ctx.Request.Form.Get("callback")
-	if callback == "" {
-		http.Error(c.Ctx.ResponseWriter, `"callback" parameter required`, http.StatusInternalServerError)
-		return
-	}
-	callback_content := bytes.NewBufferString(callback)
-	callback_content.WriteString("(")
-	callback_content.Write(content)
-	callback_content.WriteString(");\r\n")
-	c.Ctx.ResponseWriter.Header().Set("Content-Type", "application/javascript;charset=UTF-8")
-	c.writeToWriter(callback_content.Bytes())
+	c.Ctx.Output.JSONP(c.Data["jsonp"], hasIndent)
 }
 
-func (c *Controller) ServeXml() {
-	var content []byte
-	var err error
-	if RunMode == "prod" {
-		content, err = xml.Marshal(c.Data["xml"])
-	} else {
-		content, err = xml.MarshalIndent(c.Data["xml"], "", "  ")
+// ServeXML sends xml response.
+func (c *Controller) ServeXML() {
+	hasIndent := true
+	if BConfig.RunMode == PROD {
+		hasIndent = false
 	}
-	if err != nil {
-		http.Error(c.Ctx.ResponseWriter, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	c.Ctx.ResponseWriter.Header().Set("Content-Type", "application/xml;charset=UTF-8")
-	c.writeToWriter(content)
+	c.Ctx.Output.XML(c.Data["xml"], hasIndent)
 }
 
+// ServeFormatted serve Xml OR Json, depending on the value of the Accept header
+func (c *Controller) ServeFormatted() {
+	accept := c.Ctx.Input.Header("Accept")
+	switch accept {
+	case applicationJSON:
+		c.ServeJSON()
+	case applicationXML, textXML:
+		c.ServeXML()
+	default:
+		c.ServeJSON()
+	}
+}
+
+// Input returns the input data map from POST or PUT request body and query string.
 func (c *Controller) Input() url.Values {
-	ct := c.Ctx.Request.Header.Get("Content-Type")
-	if strings.Contains(ct, "multipart/form-data") {
-		c.Ctx.Request.ParseMultipartForm(MaxMemory) //64MB
-	} else {
+	if c.Ctx.Request.Form == nil {
 		c.Ctx.Request.ParseForm()
 	}
 	return c.Ctx.Request.Form
 }
 
+// ParseForm maps input data map to obj struct.
 func (c *Controller) ParseForm(obj interface{}) error {
 	return ParseForm(c.Input(), obj)
 }
 
-func (c *Controller) GetString(key string) string {
-	return c.Input().Get(key)
+// GetString returns the input value by key string or the default value while it's present and input is blank
+func (c *Controller) GetString(key string, def ...string) string {
+	if v := c.Ctx.Input.Query(key); v != "" {
+		return v
+	}
+	if len(def) > 0 {
+		return def[0]
+	}
+	return ""
 }
 
-func (c *Controller) GetStrings(key string) []string {
-	r := c.Ctx.Request
-	if r.Form == nil {
-		return []string{}
+// GetStrings returns the input string slice by key string or the default value while it's present and input is blank
+// it's designed for multi-value input field such as checkbox(input[type=checkbox]), multi-selection.
+func (c *Controller) GetStrings(key string, def ...[]string) []string {
+	var defv []string
+	if len(def) > 0 {
+		defv = def[0]
 	}
-	vs := r.Form[key]
-	if len(vs) > 0 {
+
+	if f := c.Input(); f == nil {
+		return defv
+	} else if vs := f[key]; len(vs) > 0 {
 		return vs
 	}
-	return []string{}
+
+	return defv
 }
 
-func (c *Controller) GetInt(key string) (int64, error) {
-	return strconv.ParseInt(c.Input().Get(key), 10, 64)
+// GetInt returns input as an int or the default value while it's present and input is blank
+func (c *Controller) GetInt(key string, def ...int) (int, error) {
+	strv := c.Ctx.Input.Query(key)
+	if len(strv) == 0 && len(def) > 0 {
+		return def[0], nil
+	}
+	return strconv.Atoi(strv)
 }
 
-func (c *Controller) GetBool(key string) (bool, error) {
-	return strconv.ParseBool(c.Input().Get(key))
+// GetInt8 return input as an int8 or the default value while it's present and input is blank
+func (c *Controller) GetInt8(key string, def ...int8) (int8, error) {
+	strv := c.Ctx.Input.Query(key)
+	if len(strv) == 0 && len(def) > 0 {
+		return def[0], nil
+	}
+	i64, err := strconv.ParseInt(strv, 10, 8)
+	return int8(i64), err
 }
 
+// GetInt16 returns input as an int16 or the default value while it's present and input is blank
+func (c *Controller) GetInt16(key string, def ...int16) (int16, error) {
+	strv := c.Ctx.Input.Query(key)
+	if len(strv) == 0 && len(def) > 0 {
+		return def[0], nil
+	}
+	i64, err := strconv.ParseInt(strv, 10, 16)
+	return int16(i64), err
+}
+
+// GetInt32 returns input as an int32 or the default value while it's present and input is blank
+func (c *Controller) GetInt32(key string, def ...int32) (int32, error) {
+	strv := c.Ctx.Input.Query(key)
+	if len(strv) == 0 && len(def) > 0 {
+		return def[0], nil
+	}
+	i64, err := strconv.ParseInt(strv, 10, 32)
+	return int32(i64), err
+}
+
+// GetInt64 returns input value as int64 or the default value while it's present and input is blank.
+func (c *Controller) GetInt64(key string, def ...int64) (int64, error) {
+	strv := c.Ctx.Input.Query(key)
+	if len(strv) == 0 && len(def) > 0 {
+		return def[0], nil
+	}
+	return strconv.ParseInt(strv, 10, 64)
+}
+
+// GetBool returns input value as bool or the default value while it's present and input is blank.
+func (c *Controller) GetBool(key string, def ...bool) (bool, error) {
+	strv := c.Ctx.Input.Query(key)
+	if len(strv) == 0 && len(def) > 0 {
+		return def[0], nil
+	}
+	return strconv.ParseBool(strv)
+}
+
+// GetFloat returns input value as float64 or the default value while it's present and input is blank.
+func (c *Controller) GetFloat(key string, def ...float64) (float64, error) {
+	strv := c.Ctx.Input.Query(key)
+	if len(strv) == 0 && len(def) > 0 {
+		return def[0], nil
+	}
+	return strconv.ParseFloat(strv, 64)
+}
+
+// GetFile returns the file data in file upload field named as key.
+// it returns the first one of multi-uploaded files.
 func (c *Controller) GetFile(key string) (multipart.File, *multipart.FileHeader, error) {
 	return c.Ctx.Request.FormFile(key)
 }
 
+// GetFiles return multi-upload files
+// files, err:=c.Getfiles("myfiles")
+//	if err != nil {
+//		http.Error(w, err.Error(), http.StatusNoContent)
+//		return
+//	}
+// for i, _ := range files {
+//	//for each fileheader, get a handle to the actual file
+//	file, err := files[i].Open()
+//	defer file.Close()
+//	if err != nil {
+//		http.Error(w, err.Error(), http.StatusInternalServerError)
+//		return
+//	}
+//	//create destination file making sure the path is writeable.
+//	dst, err := os.Create("upload/" + files[i].Filename)
+//	defer dst.Close()
+//	if err != nil {
+//		http.Error(w, err.Error(), http.StatusInternalServerError)
+//		return
+//	}
+//	//copy the uploaded file to the destination file
+//	if _, err := io.Copy(dst, file); err != nil {
+//		http.Error(w, err.Error(), http.StatusInternalServerError)
+//		return
+//	}
+// }
+func (c *Controller) GetFiles(key string) ([]*multipart.FileHeader, error) {
+	if files, ok := c.Ctx.Request.MultipartForm.File[key]; ok {
+		return files, nil
+	}
+	return nil, http.ErrMissingFile
+}
+
+// SaveToFile saves uploaded file to new path.
+// it only operates the first one of mutil-upload form file field.
 func (c *Controller) SaveToFile(fromfile, tofile string) error {
 	file, _, err := c.Ctx.Request.FormFile(fromfile)
 	if err != nil {
@@ -332,13 +498,15 @@ func (c *Controller) SaveToFile(fromfile, tofile string) error {
 	return nil
 }
 
-func (c *Controller) StartSession() session.SessionStore {
+// StartSession starts session and load old session data info this controller.
+func (c *Controller) StartSession() session.Store {
 	if c.CruSession == nil {
-		c.CruSession = GlobalSessions.SessionStart(c.Ctx.ResponseWriter, c.Ctx.Request)
+		c.CruSession = c.Ctx.Input.CruSession
 	}
 	return c.CruSession
 }
 
+// SetSession puts value into session.
 func (c *Controller) SetSession(name interface{}, value interface{}) {
 	if c.CruSession == nil {
 		c.StartSession()
@@ -346,6 +514,7 @@ func (c *Controller) SetSession(name interface{}, value interface{}) {
 	c.CruSession.Set(name, value)
 }
 
+// GetSession gets value from session.
 func (c *Controller) GetSession(name interface{}) interface{} {
 	if c.CruSession == nil {
 		c.StartSession()
@@ -353,6 +522,7 @@ func (c *Controller) GetSession(name interface{}) interface{} {
 	return c.CruSession.Get(name)
 }
 
+// DelSession removes value from session.
 func (c *Controller) DelSession(name interface{}) {
 	if c.CruSession == nil {
 		c.StartSession()
@@ -360,61 +530,67 @@ func (c *Controller) DelSession(name interface{}) {
 	c.CruSession.Delete(name)
 }
 
+// SessionRegenerateID regenerates session id for this session.
+// the session data have no changes.
+func (c *Controller) SessionRegenerateID() {
+	if c.CruSession != nil {
+		c.CruSession.SessionRelease(c.Ctx.ResponseWriter)
+	}
+	c.CruSession = GlobalSessions.SessionRegenerateID(c.Ctx.ResponseWriter, c.Ctx.Request)
+	c.Ctx.Input.CruSession = c.CruSession
+}
+
+// DestroySession cleans session data and session cookie.
 func (c *Controller) DestroySession() {
+	c.Ctx.Input.CruSession.Flush()
+	c.Ctx.Input.CruSession = nil
 	GlobalSessions.SessionDestroy(c.Ctx.ResponseWriter, c.Ctx.Request)
 }
 
+// IsAjax returns this request is ajax or not.
 func (c *Controller) IsAjax() bool {
-	return (c.Ctx.Request.Header.Get("HTTP_X_REQUESTED_WITH") == "XMLHttpRequest")
+	return c.Ctx.Input.IsAjax()
 }
 
-func (c *Controller) XsrfToken() string {
-	if c._xsrf_token == "" {
-		token := c.Ctx.GetCookie("_xsrf")
-		if token == "" {
-			h := hmac.New(sha1.New, []byte(XSRFKEY))
-			fmt.Fprintf(h, "%s:%d", c.Ctx.Request.RemoteAddr, time.Now().UnixNano())
-			tok := fmt.Sprintf("%s:%d", h.Sum(nil), time.Now().UnixNano())
-			token = base64.URLEncoding.EncodeToString([]byte(tok))
-			expire := 0
-			if c.XSRFExpire > 0 {
-				expire = c.XSRFExpire
-			} else {
-				expire = XSRFExpire
-			}
-			c.Ctx.SetCookie("_xsrf", token, expire)
+// GetSecureCookie returns decoded cookie value from encoded browser cookie values.
+func (c *Controller) GetSecureCookie(Secret, key string) (string, bool) {
+	return c.Ctx.GetSecureCookie(Secret, key)
+}
+
+// SetSecureCookie puts value into cookie after encoded the value.
+func (c *Controller) SetSecureCookie(Secret, name, value string, others ...interface{}) {
+	c.Ctx.SetSecureCookie(Secret, name, value, others...)
+}
+
+// XSRFToken creates a CSRF token string and returns.
+func (c *Controller) XSRFToken() string {
+	if c._xsrfToken == "" {
+		expire := int64(BConfig.WebConfig.XSRFExpire)
+		if c.XSRFExpire > 0 {
+			expire = int64(c.XSRFExpire)
 		}
-		c._xsrf_token = token
+		c._xsrfToken = c.Ctx.XSRFToken(BConfig.WebConfig.XSRFKey, expire)
 	}
-	return c._xsrf_token
+	return c._xsrfToken
 }
 
-func (c *Controller) CheckXsrfCookie() bool {
-	token := c.GetString("_xsrf")
-	if token == "" {
-		token = c.Ctx.Request.Header.Get("X-Xsrftoken")
+// CheckXSRFCookie checks xsrf token in this request is valid or not.
+// the token can provided in request header "X-Xsrftoken" and "X-CsrfToken"
+// or in form field value named as "_xsrf".
+func (c *Controller) CheckXSRFCookie() bool {
+	if !c.EnableXSRF {
+		return true
 	}
-	if token == "" {
-		token = c.Ctx.Request.Header.Get("X-Csrftoken")
-	}
-	if token == "" {
-		c.Ctx.Abort(403, "'_xsrf' argument missing from POST")
-	}
-
-	if c._xsrf_token != token {
-		c.Ctx.Abort(403, "XSRF cookie does not match POST argument")
-	}
-	return true
+	return c.Ctx.CheckXSRFCookie()
 }
 
-func (c *Controller) XsrfFormHtml() string {
-	return "<input type=\"hidden\" name=\"_xsrf\" value=\"" +
-		c._xsrf_token + "\"/>"
+// XSRFFormHTML writes an input field contains xsrf token value.
+func (c *Controller) XSRFFormHTML() string {
+	return `<input type="hidden" name="_xsrf" value="` +
+		c.XSRFToken() + `" />`
 }
 
-func (c *Controller) GoToFunc(funcname string) {
-	if funcname[0] < 65 || funcname[0] > 90 {
-		panic("GoToFunc should exported function")
-	}
-	c.gotofunc = funcname
+// GetControllerAndAction gets the executing controller name and action name.
+func (c *Controller) GetControllerAndAction() (string, string) {
+	return c.controllerName, c.actionName
 }

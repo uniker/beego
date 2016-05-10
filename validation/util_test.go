@@ -1,3 +1,17 @@
+// Copyright 2014 beego Author. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package validation
 
 import (
@@ -6,7 +20,7 @@ import (
 )
 
 type user struct {
-	Id    int
+	ID    int
 	Tag   string `valid:"Maxx(aa)"`
 	Name  string `valid:"Required;"`
 	Age   int    `valid:"Required;Range(1, 140)"`
@@ -19,7 +33,7 @@ func TestGetValidFuncs(t *testing.T) {
 	var vfs []ValidFunc
 	var err error
 
-	f, _ := tf.FieldByName("Id")
+	f, _ := tf.FieldByName("ID")
 	if vfs, err = getValidFuncs(f); err != nil {
 		t.Fatal(err)
 	}

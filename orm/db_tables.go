@@ -1,3 +1,17 @@
+// Copyright 2014 beego Author. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package orm
 
 import (
@@ -6,6 +20,7 @@ import (
 	"time"
 )
 
+// table info struct.
 type dbTable struct {
 	id    int
 	index string
@@ -18,13 +33,17 @@ type dbTable struct {
 	jtl   *dbTable
 }
 
+// tables collection struct, contains some tables.
 type dbTables struct {
 	tablesM map[string]*dbTable
 	tables  []*dbTable
 	mi      *modelInfo
 	base    dbBaser
+	skipEnd bool
 }
 
+// set table info to collection.
+// if not exist, create new.
 func (t *dbTables) set(names []string, mi *modelInfo, fi *fieldInfo, inner bool) *dbTable {
 	name := strings.Join(names, ExprSep)
 	if j, ok := t.tablesM[name]; ok {
@@ -41,6 +60,7 @@ func (t *dbTables) set(names []string, mi *modelInfo, fi *fieldInfo, inner bool)
 	return t.tablesM[name]
 }
 
+// add table info to collection.
 func (t *dbTables) add(names []string, mi *modelInfo, fi *fieldInfo, inner bool) (*dbTable, bool) {
 	name := strings.Join(names, ExprSep)
 	if _, ok := t.tablesM[name]; ok == false {
@@ -53,11 +73,14 @@ func (t *dbTables) add(names []string, mi *modelInfo, fi *fieldInfo, inner bool)
 	return t.tablesM[name], false
 }
 
+// get table info in collection.
 func (t *dbTables) get(name string) (*dbTable, bool) {
 	j, ok := t.tablesM[name]
 	return j, ok
 }
 
+// get related fields info in recursive depth loop.
+// loop once, depth decreases one.
 func (t *dbTables) loopDepth(depth int, prefix string, fi *fieldInfo, related []string) []string {
 	if depth < 0 || fi.fieldType == RelManyToMany {
 		return related
@@ -78,6 +101,7 @@ func (t *dbTables) loopDepth(depth int, prefix string, fi *fieldInfo, related []
 	return related
 }
 
+// parse related fields.
 func (t *dbTables) parseRelated(rels []string, depth int) {
 
 	relsNum := len(rels)
@@ -100,22 +124,29 @@ func (t *dbTables) parseRelated(rels []string, depth int) {
 			exs    = strings.Split(s, ExprSep)
 			names  = make([]string, 0, len(exs))
 			mmi    = t.mi
-			cansel = true
+			cancel = true
 			jtl    *dbTable
 		)
+
+		inner := true
+
 		for _, ex := range exs {
 			if fi, ok := mmi.fields.GetByAny(ex); ok && fi.rel && fi.fieldType != RelManyToMany {
 				names = append(names, fi.name)
 				mmi = fi.relModelInfo
 
-				jt := t.set(names, mmi, fi, fi.null == false)
+				if fi.null || t.skipEnd {
+					inner = false
+				}
+
+				jt := t.set(names, mmi, fi, inner)
 				jt.jtl = jtl
 
 				if fi.reverse {
-					cansel = false
+					cancel = false
 				}
 
-				if cansel {
+				if cancel {
 					jt.sel = depth > 0
 
 					if i < relsNum {
@@ -126,13 +157,14 @@ func (t *dbTables) parseRelated(rels []string, depth int) {
 				jtl = jt
 
 			} else {
-				panic(fmt.Sprintf("unknown model/table name `%s`", ex))
+				panic(fmt.Errorf("unknown model/table name `%s`", ex))
 			}
 		}
 	}
 }
 
-func (t *dbTables) getJoinSql() (join string) {
+// generate join string.
+func (t *dbTables) getJoinSQL() (join string) {
 	Q := t.base.TableQuote()
 
 	for _, jt := range t.tables {
@@ -154,7 +186,7 @@ func (t *dbTables) getJoinSql() (join string) {
 		table = jt.mi.table
 
 		switch {
-		case jt.fi.fieldType == RelManyToMany || jt.fi.reverse && jt.fi.reverseFieldInfo.fieldType == RelManyToMany:
+		case jt.fi.fieldType == RelManyToMany || jt.fi.fieldType == RelReverseMany || jt.fi.reverse && jt.fi.reverseFieldInfo.fieldType == RelManyToMany:
 			c1 = jt.fi.mi.fields.pk.column
 			for _, ffi := range jt.mi.fields.fieldsRel {
 				if jt.fi.mi == ffi.relModelInfo {
@@ -178,83 +210,109 @@ func (t *dbTables) getJoinSql() (join string) {
 	return
 }
 
-func (d *dbTables) parseExprs(mi *modelInfo, exprs []string) (index, name string, info *fieldInfo, success bool) {
+// parse orm model struct field tag expression.
+func (t *dbTables) parseExprs(mi *modelInfo, exprs []string) (index, name string, info *fieldInfo, success bool) {
 	var (
-		ffi *fieldInfo
 		jtl *dbTable
+		fi  *fieldInfo
+		fiN *fieldInfo
 		mmi = mi
 	)
 
 	num := len(exprs) - 1
-	names := make([]string, 0)
+	var names []string
 
+	inner := true
+
+loopFor:
 	for i, ex := range exprs {
-		exist := false
 
-	check:
-		fi, ok := mmi.fields.GetByAny(ex)
+		var ok, okN bool
+
+		if fiN != nil {
+			fi = fiN
+			ok = true
+			fiN = nil
+		}
+
+		if i == 0 {
+			fi, ok = mmi.fields.GetByAny(ex)
+		}
+
+		_ = okN
 
 		if ok {
 
+			isRel := fi.rel || fi.reverse
+
+			names = append(names, fi.name)
+
+			switch {
+			case fi.rel:
+				mmi = fi.relModelInfo
+				if fi.fieldType == RelManyToMany {
+					mmi = fi.relThroughModelInfo
+				}
+			case fi.reverse:
+				mmi = fi.reverseFieldInfo.mi
+			}
+
+			if i < num {
+				fiN, okN = mmi.fields.GetByAny(exprs[i+1])
+			}
+
+			if isRel && (fi.mi.isThrough == false || num != i) {
+				if fi.null || t.skipEnd {
+					inner = false
+				}
+
+				if t.skipEnd && okN || !t.skipEnd {
+					if t.skipEnd && okN && fiN.pk {
+						goto loopEnd
+					}
+
+					jt, _ := t.add(names, mmi, fi, inner)
+					jt.jtl = jtl
+					jtl = jt
+				}
+
+			}
+
 			if num != i {
-				names = append(names, fi.name)
+				continue
+			}
 
-				switch {
-				case fi.rel:
-					mmi = fi.relModelInfo
-					if fi.fieldType == RelManyToMany {
-						mmi = fi.relThroughModelInfo
-					}
-				case fi.reverse:
-					mmi = fi.reverseFieldInfo.mi
-					if fi.reverseFieldInfo.fieldType == RelManyToMany {
-						mmi = fi.reverseFieldInfo.relThroughModelInfo
-					}
-				default:
-					return
-				}
+		loopEnd:
 
-				jt, _ := d.add(names, mmi, fi, fi.null == false)
-				jt.jtl = jtl
-				jtl = jt
-
-				if fi.rel && fi.fieldType == RelManyToMany {
-					ex = fi.relModelInfo.name
-					goto check
-				}
-
-				if fi.reverse && fi.reverseFieldInfo.fieldType == RelManyToMany {
-					ex = fi.reverseFieldInfo.mi.name
-					goto check
-				}
-
-				exist = true
-
+			if i == 0 || jtl == nil {
+				index = "T0"
 			} else {
+				index = jtl.index
+			}
 
-				if ffi == nil {
-					index = "T0"
-				} else {
+			info = fi
+
+			if jtl == nil {
+				name = fi.name
+			} else {
+				name = jtl.name + ExprSep + fi.name
+			}
+
+			switch {
+			case fi.rel:
+
+			case fi.reverse:
+				switch fi.reverseFieldInfo.fieldType {
+				case RelOneToOne, RelForeignKey:
 					index = jtl.index
-				}
-				info = fi
-				if jtl != nil {
-					name = jtl.name + ExprSep + fi.name
-				} else {
-					name = fi.name
-				}
-
-				switch fi.fieldType {
-				case RelManyToMany, RelReverseMany:
-				default:
-					exist = true
+					info = fi.reverseFieldInfo.mi.fields.pk
+					name = info.name
 				}
 			}
 
-			ffi = fi
-		}
+			break loopFor
 
-		if exist == false {
+		} else {
 			index = ""
 			name = ""
 			info = nil
@@ -267,16 +325,16 @@ func (d *dbTables) parseExprs(mi *modelInfo, exprs []string) (index, name string
 	return
 }
 
-func (d *dbTables) getCondSql(cond *Condition, sub bool, tz *time.Location) (where string, params []interface{}) {
+// generate condition sql.
+func (t *dbTables) getCondSQL(cond *Condition, sub bool, tz *time.Location) (where string, params []interface{}) {
 	if cond == nil || cond.IsEmpty() {
 		return
 	}
 
-	Q := d.base.TableQuote()
+	Q := t.base.TableQuote()
 
-	mi := d.mi
+	mi := t.mi
 
-	// outFor:
 	for i, p := range cond.params {
 		if i > 0 {
 			if p.isOr {
@@ -289,7 +347,7 @@ func (d *dbTables) getCondSql(cond *Condition, sub bool, tz *time.Location) (whe
 			where += "NOT "
 		}
 		if p.isCond {
-			w, ps := d.getCondSql(p.cond, true, tz)
+			w, ps := t.getCondSQL(p.cond, true, tz)
 			if w != "" {
 				w = fmt.Sprintf("( %s) ", w)
 			}
@@ -305,7 +363,7 @@ func (d *dbTables) getCondSql(cond *Condition, sub bool, tz *time.Location) (whe
 				exprs = exprs[:num]
 			}
 
-			index, _, fi, suc := d.parseExprs(mi, exprs)
+			index, _, fi, suc := t.parseExprs(mi, exprs)
 			if suc == false {
 				panic(fmt.Errorf("unknown field/column name `%s`", strings.Join(p.exprs, ExprSep)))
 			}
@@ -314,12 +372,12 @@ func (d *dbTables) getCondSql(cond *Condition, sub bool, tz *time.Location) (whe
 				operator = "exact"
 			}
 
-			operSql, args := d.base.GenerateOperatorSql(mi, fi, operator, p.args, tz)
+			operSQL, args := t.base.GenerateOperatorSQL(mi, fi, operator, p.args, tz)
 
 			leftCol := fmt.Sprintf("%s.%s%s%s", index, Q, fi.column, Q)
-			d.base.GenerateOperatorLeftCol(fi, operator, &leftCol)
+			t.base.GenerateOperatorLeftCol(fi, operator, &leftCol)
 
-			where += fmt.Sprintf("%s %s ", leftCol, operSql)
+			where += fmt.Sprintf("%s %s ", leftCol, operSQL)
 			params = append(params, args...)
 
 		}
@@ -332,12 +390,37 @@ func (d *dbTables) getCondSql(cond *Condition, sub bool, tz *time.Location) (whe
 	return
 }
 
-func (d *dbTables) getOrderSql(orders []string) (orderSql string) {
+// generate group sql.
+func (t *dbTables) getGroupSQL(groups []string) (groupSQL string) {
+	if len(groups) == 0 {
+		return
+	}
+
+	Q := t.base.TableQuote()
+
+	groupSqls := make([]string, 0, len(groups))
+	for _, group := range groups {
+		exprs := strings.Split(group, ExprSep)
+
+		index, _, fi, suc := t.parseExprs(t.mi, exprs)
+		if suc == false {
+			panic(fmt.Errorf("unknown field/column name `%s`", strings.Join(exprs, ExprSep)))
+		}
+
+		groupSqls = append(groupSqls, fmt.Sprintf("%s.%s%s%s", index, Q, fi.column, Q))
+	}
+
+	groupSQL = fmt.Sprintf("GROUP BY %s ", strings.Join(groupSqls, ", "))
+	return
+}
+
+// generate order sql.
+func (t *dbTables) getOrderSQL(orders []string) (orderSQL string) {
 	if len(orders) == 0 {
 		return
 	}
 
-	Q := d.base.TableQuote()
+	Q := t.base.TableQuote()
 
 	orderSqls := make([]string, 0, len(orders))
 	for _, order := range orders {
@@ -348,7 +431,7 @@ func (d *dbTables) getOrderSql(orders []string) (orderSql string) {
 		}
 		exprs := strings.Split(order, ExprSep)
 
-		index, _, fi, suc := d.parseExprs(d.mi, exprs)
+		index, _, fi, suc := t.parseExprs(t.mi, exprs)
 		if suc == false {
 			panic(fmt.Errorf("unknown field/column name `%s`", strings.Join(exprs, ExprSep)))
 		}
@@ -356,18 +439,19 @@ func (d *dbTables) getOrderSql(orders []string) (orderSql string) {
 		orderSqls = append(orderSqls, fmt.Sprintf("%s.%s%s%s %s", index, Q, fi.column, Q, asc))
 	}
 
-	orderSql = fmt.Sprintf("ORDER BY %s ", strings.Join(orderSqls, ", "))
+	orderSQL = fmt.Sprintf("ORDER BY %s ", strings.Join(orderSqls, ", "))
 	return
 }
 
-func (d *dbTables) getLimitSql(mi *modelInfo, offset int64, limit int) (limits string) {
+// generate limit sql.
+func (t *dbTables) getLimitSQL(mi *modelInfo, offset int64, limit int64) (limits string) {
 	if limit == 0 {
-		limit = DefaultRowsLimit
+		limit = int64(DefaultRowsLimit)
 	}
 	if limit < 0 {
 		// no limit
 		if offset > 0 {
-			maxLimit := d.base.MaxLimit()
+			maxLimit := t.base.MaxLimit()
 			if maxLimit == 0 {
 				limits = fmt.Sprintf("OFFSET %d", offset)
 			} else {
@@ -382,6 +466,7 @@ func (d *dbTables) getLimitSql(mi *modelInfo, offset int64, limit int) (limits s
 	return
 }
 
+// crete new tables collection.
 func newDbTables(mi *modelInfo, base dbBaser) *dbTables {
 	tables := &dbTables{}
 	tables.tablesM = make(map[string]*dbTable)

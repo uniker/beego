@@ -1,3 +1,17 @@
+// Copyright 2014 beego Author. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package validation
 
 import (
@@ -11,6 +25,12 @@ func TestRequired(t *testing.T) {
 
 	if valid.Required(nil, "nil").Ok {
 		t.Error("nil object should be false")
+	}
+	if !valid.Required(true, "bool").Ok {
+		t.Error("Bool value should always return true")
+	}
+	if !valid.Required(false, "bool").Ok {
+		t.Error("Bool value should always return true")
 	}
 	if valid.Required("", "string").Ok {
 		t.Error("\"'\" string should be false")
@@ -282,7 +302,7 @@ func TestZipCode(t *testing.T) {
 
 func TestValid(t *testing.T) {
 	type user struct {
-		Id   int
+		ID   int
 		Name string `valid:"Required;Match(/^(test)?\\w*@(/test/);com$/)"`
 		Age  int    `valid:"Required;Range(1, 140)"`
 	}
@@ -327,5 +347,35 @@ func TestValid(t *testing.T) {
 	}
 	if valid.Errors[0].Key != "Age.Range" {
 		t.Errorf("Message key should be `Name.Match` but got %s", valid.Errors[0].Key)
+	}
+}
+
+func TestRecursiveValid(t *testing.T) {
+	type User struct {
+		ID   int
+		Name string `valid:"Required;Match(/^(test)?\\w*@(/test/);com$/)"`
+		Age  int    `valid:"Required;Range(1, 140)"`
+	}
+
+	type AnonymouseUser struct {
+		ID2   int
+		Name2 string `valid:"Required;Match(/^(test)?\\w*@(/test/);com$/)"`
+		Age2  int    `valid:"Required;Range(1, 140)"`
+	}
+
+	type Account struct {
+		Password string `valid:"Required"`
+		U        User
+		AnonymouseUser
+	}
+	valid := Validation{}
+
+	u := Account{Password: "abc123_", U: User{}}
+	b, err := valid.RecursiveValid(u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b {
+		t.Error("validation should not be passed")
 	}
 }
